@@ -5,17 +5,52 @@ import smtplib
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from typing import List, Dict
+from dotenv import load_dotenv
+from zoneinfo import ZoneInfo
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from twilio.rest import Client
 
+# ========================================
+# CONFIG PREP, SETUP and DEFINITIONS
+# ========================================
 
-# =========================
-# CONFIG (ENV-DRIVEN)
-# =========================
+# Load environment variables from .env file and injecting them such that
+# os.getenv() can access them
+load_dotenv()
 
-TIMEZONE = timezone.utc  # adjust if needed
+# Helper to get env vars and sqwak exceptions if something is missing
+# and yes, copilot, I want it to say sqwak and I know it's overkill but whatever...
+# it needs to be maintainable and stop suggesting endings to my comments!!!
+def get_env(key: str, required: bool = True, default: str = None):
+    value = os.getenv(key, default)
+    if required and not value:
+        raise ValueError(f"Missing required environment variable: {key}")
+    return value
+
+TIMEZONE = ZoneInfo("America/Chicago")  # adjust if needed
+
+def parse_event_time(event):
+    start = event["start"]
+
+    # All-day event
+    if "date" in start:
+        return {
+            "dt": None,
+            "time_str": "All Day",
+            "day": start["date"]
+        }
+
+    # Timed event
+    dt = datetime.fromisoformat(start["dateTime"].replace("Z", "+00:00"))
+    dt = dt.astimezone(TIMEZONE)
+
+    return {
+        "dt": dt,
+        "time_str": dt.strftime("%I:%M %p").lstrip("0"),
+        "day": dt.strftime("%Y-%m-%d")
+    }
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
@@ -28,6 +63,11 @@ EMAIL_RECIPIENTS = os.getenv("EMAIL_RECIPIENTS", "").split(",")
 
 GOOGLE_TOKEN_FILE = os.getenv("GOOGLE_TOKEN_FILE", "token.json")
 
+print(f"CONFIG CHECK:")
+print(f"TWILIO_ACCOUNT_SID: {TWILIO_ACCOUNT_SID}")
+print(f"SMS_RECIPIENTS: {SMS_RECIPIENTS}")
+print(f"EMAIL_SENDER: {EMAIL_SENDER}")
+print(f"GOOGLE_TOKEN_FILE: {GOOGLE_TOKEN_FILE}")
 
 # =========================
 # CALENDAR CLIENT
@@ -51,7 +91,7 @@ def fetch_events(service) -> List[Dict]:
     start, end = get_week_bounds()
 
     events_result = service.events().list(
-        calendarId="primary",
+        calendarId="family00786821299684947027@group.calendar.google.com",
         timeMin=start.isoformat(),
         timeMax=end.isoformat(),
         singleEvents=True,
@@ -60,6 +100,45 @@ def fetch_events(service) -> List[Dict]:
 
     return events_result.get("items", [])
 
+
+# This is a testing function to list available calendars tied in a google account
+# it's not really useful for anything other than debugging
+# I struggled a lot with getting the right events until I realized there are 
+# multiple calendars avaialbe to a single account
+def list_calendars(service):
+    print("\nAvailable calendars:\n")
+
+    calendars = service.calendarList().list().execute()
+
+    for cal in calendars.get("items", []):
+        print(f"- {cal['summary']}")
+        print(f"  id: {cal['id']}\n")
+
+
+def group_events(events):
+    grouped = {}
+
+    for event in events:
+        title = event.get("summary", "No Title")
+        parsed = parse_event_time(event)
+
+        day_key = parsed["day"]  # YYYY-MM-DD
+
+        grouped.setdefault(day_key, []).append({
+            "time": parsed["time_str"],
+            "title": title,
+            "dt": parsed["dt"]
+        })
+
+    return grouped
+
+
+def sort_grouped_events(grouped):
+    for day in grouped:
+        grouped[day].sort(
+            key=lambda e: (e["dt"] is not None, e["dt"] or datetime.min)
+        )
+    return grouped
 
 # =========================
 # PROCESSING
@@ -93,34 +172,84 @@ def process_events(events: List[Dict]) -> Dict[str, List[Dict]]:
     return grouped
 
 
+# special formatter for SMS to keep the length down and just show late events (3pm or later)
+def get_late_event_titles(items):
+    late = []
+
+    for e in items:
+        if e["dt"] is None:
+            continue  # skip all-day here
+
+        if e["dt"].hour >= 15:
+            late.append(e["title"])
+
+    return late
+
 # =========================
 # FORMATTERS
 # =========================
 
-def format_sms(grouped: Dict[str, List[Dict]]) -> str:
+def format_sms(grouped):
     lines = []
-    week_label = datetime.now().strftime("Week of %b %d")
-    lines.append(week_label)
 
-    for day, events in grouped.items():
-        lines.append(f"\n{day[:3]}:")
-        for e in events:
-            lines.append(f"- {e['time']} {e['title']}")
+    first_day = next(iter(grouped))
+    dt = datetime.fromisoformat(first_day)
+    lines.append(dt.strftime("Week of %b %d\n"))
+
+    for day, items in grouped.items():
+        day_label = format_day_label(day).split()[0]
+
+        total = len(items)
+
+        # All-day events
+        all_day = [e for e in items if e["time"] == "All Day"]
+
+        # Late events (after 3PM)
+        late_titles = get_late_event_titles(items)
+
+        line = f"{day_label}: {total} events"
+
+        if all_day:
+            summary = ", ".join(e["title"] for e in all_day[:1])
+            extra = total - len(all_day)
+
+            if extra > 0:
+                summary += f" + {extra} events"
+
+            line = f"{day_label}: {summary}"
+
+        elif late_titles:
+            # keep it tight — limit to 3 items
+            preview = ", ".join(late_titles[:3])
+
+            if len(late_titles) > 3:
+                preview += "..."
+
+            line += f" ({preview})"
+
+        lines.append(line)
 
     return "\n".join(lines)
 
 
-def format_email(grouped: Dict[str, List[Dict]]) -> str:
+def format_email(grouped):
     lines = ["Weekly Family Schedule\n"]
 
-    for day, events in grouped.items():
-        lines.append(day)
-        for e in events:
-            lines.append(f"- {e['time']} – {e['title']}")
-        lines.append("")
+    for day, items in grouped.items():
+        lines.append(format_day_label(day))
+
+        for e in items:
+            lines.append(f"  - {e['time']} {e['title']}")
+
+        lines.append("")  # blank line between days
 
     return "\n".join(lines)
 
+
+def format_day_label(day_str: str) -> str:
+    dt = datetime.fromisoformat(day_str)
+
+    return dt.strftime("%a (%b %d)")
 
 # =========================
 # NOTIFICATIONS
@@ -153,29 +282,48 @@ def send_email(message: str):
 # MAIN EXECUTION
 # =========================
 
+#def run():
+#    print("Starting weekly digest job...")
+#
+#    service = get_calendar_service()
+#    raw_events = fetch_events(service)
+#
+#    if not raw_events:
+#        print("No events found for this week.")
+#        return
+#
+#    grouped = process_events(raw_events)
+#
+#    sms_message = format_sms(grouped)
+#    email_message = format_email(grouped)
+#
+#    print("Sending SMS...")
+#    send_sms(sms_message)
+#
+#    print("Sending Email...")
+#    send_email(email_message)
+#
+#    print("Done.")
+
 def run():
-    print("Starting weekly digest job...")
+    print("Fetching calendar events...\n")
 
     service = get_calendar_service()
-    raw_events = fetch_events(service)
+    events = fetch_events(service)
 
-    if not raw_events:
-        print("No events found for this week.")
-        return
+    print(f"Fetched {len(events)} events\n")
 
-    grouped = process_events(raw_events)
+    grouped = group_events(events)
+    grouped = sort_grouped_events(grouped)
 
-    sms_message = format_sms(grouped)
-    email_message = format_email(grouped)
+    sms = format_sms(grouped)
+    email = format_email(grouped)
 
-    print("Sending SMS...")
-    send_sms(sms_message)
+    print("=== SMS PREVIEW ===\n")
+    print(sms)
 
-    print("Sending Email...")
-    send_email(email_message)
-
-    print("Done.")
-
+    print("\n=== EMAIL PREVIEW ===\n")
+    print(email)
 
 if __name__ == "__main__":
     run()
