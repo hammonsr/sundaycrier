@@ -11,6 +11,8 @@ from zoneinfo import ZoneInfo
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from twilio.rest import Client
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
 
 # ========================================
 # CONFIG PREP, SETUP and DEFINITIONS
@@ -52,15 +54,19 @@ def parse_event_time(event):
         "day": dt.strftime("%Y-%m-%d")
     }
 
+# ========== SMS CONFIG ==========
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER")
 SMS_RECIPIENTS = os.getenv("SMS_RECIPIENTS", "").split(",")
 
+# ========== EMAIL CONFIG ==========
+SENDGRID_API_KEY = get_env("SENDGRID_API_KEY")
 EMAIL_SENDER = os.getenv("EMAIL_SENDER")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 EMAIL_RECIPIENTS = os.getenv("EMAIL_RECIPIENTS", "").split(",")
 
+# ========== Google CONFIG ==========
 GOOGLE_TOKEN_FILE = os.getenv("GOOGLE_TOKEN_FILE", "token.json")
 
 print(f"CONFIG CHECK:")
@@ -268,42 +274,29 @@ def send_sms(message: str):
 
 
 def send_email(message: str):
-    msg = MIMEText(message)
-    msg["Subject"] = "Weekly Family Schedule"
-    msg["From"] = EMAIL_SENDER
-    msg["To"] = ", ".join(EMAIL_RECIPIENTS)
+    msg = Mail(
+        from_email=EMAIL_SENDER,
+        to_emails=[e.strip() for e in EMAIL_RECIPIENTS if e.strip()],
+        subject="Weekly Family Schedule",
+        plain_text_content=message
+    )
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-        server.sendmail(EMAIL_SENDER, EMAIL_RECIPIENTS, msg.as_string())
+    try:
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        response = sg.send(msg)
+        print(f"Email sent (status {response.status_code})")
+    except Exception as e:
+        print(f"Email error: {e}")
+
+        if hasattr(e, "body"):
+            print("DETAILS:")
+            print(e.body)
 
 
 # =========================
 # MAIN EXECUTION
 # =========================
 
-#def run():
-#    print("Starting weekly digest job...")
-#
-#    service = get_calendar_service()
-#    raw_events = fetch_events(service)
-#
-#    if not raw_events:
-#        print("No events found for this week.")
-#        return
-#
-#    grouped = process_events(raw_events)
-#
-#    sms_message = format_sms(grouped)
-#    email_message = format_email(grouped)
-#
-#    print("Sending SMS...")
-#    send_sms(sms_message)
-#
-#    print("Sending Email...")
-#    send_email(email_message)
-#
-#    print("Done.")
 
 def run():
     print("Fetching calendar events...\n")
@@ -324,6 +317,8 @@ def run():
 
     print("\n=== EMAIL PREVIEW ===\n")
     print(email)
+    print("\n=====================\n")
+    send_email(email)
 
 if __name__ == "__main__":
     run()
